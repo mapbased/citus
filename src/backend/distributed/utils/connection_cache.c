@@ -23,6 +23,7 @@
 #include "distributed/metadata_cache.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
+#include "nodes/pg_list.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/errcodes.h"
@@ -40,6 +41,7 @@ static HTAB *NodeConnectionHash = NULL;
 
 /* local function forward declarations */
 static HTAB * CreateNodeConnectionHash(void);
+static void ReportRemoteError(PGconn *connection, PGresult *result, bool raiseError);
 
 
 /*
@@ -190,41 +192,95 @@ PurgeConnection(PGconn *connection)
 
 
 /*
- * ReportRemoteError retrieves various error fields from the a remote result and
- * produces an error report at the WARNING level.
+ * SqlStateMatchesCategory returns true if the given sql state (which may be
+ * NULL if unknown) is in the given error category. Note that we use
+ * ERRCODE_TO_CATEGORY macro to determine error category of the sql state and
+ * expect the caller to use the same macro for the error category.
+ */
+bool
+SqlStateMatchesCategory(char *sqlStateString, int category)
+{
+	bool sqlStateMatchesCategory = false;
+	int sqlState = 0;
+	int sqlStateCategory = 0;
+
+	if (sqlStateString == NULL)
+	{
+		return false;
+	}
+
+	sqlState = MAKE_SQLSTATE(sqlStateString[0], sqlStateString[1], sqlStateString[2],
+							 sqlStateString[3], sqlStateString[4]);
+
+	sqlStateCategory = ERRCODE_TO_CATEGORY(sqlState);
+	if (sqlStateCategory == category)
+	{
+		sqlStateMatchesCategory = true;
+	}
+
+	return sqlStateMatchesCategory;
+}
+
+
+/*
+ * WarnRemoteError retrieves error fields from a remote result and produces an
+ * error report at the WARNING level after amending the error with a CONTEXT
+ * field containing the remote node host and port information.
  */
 void
-ReportRemoteError(PGconn *connection, PGresult *result)
+WarnRemoteError(PGconn *connection, PGresult *result)
+{
+	ReportRemoteError(connection, result, false);
+}
+
+
+/*
+ * ReraiseRemoteError retrieves error fields from a remote result and re-raises
+ * the error after amending it with a CONTEXT field containing the remote node
+ * host and port information.
+ */
+void
+ReraiseRemoteError(PGconn *connection, PGresult *result)
+{
+	ReportRemoteError(connection, result, true);
+}
+
+
+/*
+ * ReportRemoteError is an internal helper function which implements logic
+ * needed by both WarnRemoteError and ReraiseRemoteError. They wrap this
+ * function to provide explicit names for the possible behaviors.
+ */
+static void
+ReportRemoteError(PGconn *connection, PGresult *result, bool raiseError)
 {
 	char *sqlStateString = PQresultErrorField(result, PG_DIAG_SQLSTATE);
-	char *remoteMessage = PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY);
+	char *messagePrimary = PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY);
+	char *messageDetail = PQresultErrorField(result, PG_DIAG_MESSAGE_DETAIL);
+	char *messageHint = PQresultErrorField(result, PG_DIAG_MESSAGE_HINT);
+	char *messageContext = PQresultErrorField(result, PG_DIAG_CONTEXT);
+
 	char *nodeName = ConnectionGetOptionValue(connection, "host");
 	char *nodePort = ConnectionGetOptionValue(connection, "port");
-	char *errorPrefix = "Connection failed to";
 	int sqlState = ERRCODE_CONNECTION_FAILURE;
+	int errorLevel = WARNING;
 
 	if (sqlStateString != NULL)
 	{
 		sqlState = MAKE_SQLSTATE(sqlStateString[0], sqlStateString[1], sqlStateString[2],
 								 sqlStateString[3], sqlStateString[4]);
-
-		/* use more specific error prefix for result failures */
-		if (sqlState != ERRCODE_CONNECTION_FAILURE)
-		{
-			errorPrefix = "Bad result from";
-		}
 	}
 
 	/*
 	 * If the PGresult did not contain a message, the connection may provide a
 	 * suitable top level one. At worst, this is an empty string.
 	 */
-	if (remoteMessage == NULL)
+	if (messagePrimary == NULL)
 	{
 		char *lastNewlineIndex = NULL;
 
-		remoteMessage = PQerrorMessage(connection);
-		lastNewlineIndex = strrchr(remoteMessage, '\n');
+		messagePrimary = PQerrorMessage(connection);
+		lastNewlineIndex = strrchr(messagePrimary, '\n');
 
 		/* trim trailing newline, if any */
 		if (lastNewlineIndex != NULL)
@@ -233,9 +289,31 @@ ReportRemoteError(PGconn *connection, PGresult *result)
 		}
 	}
 
-	ereport(WARNING, (errcode(sqlState),
-					  errmsg("%s %s:%s", errorPrefix, nodeName, nodePort),
-					  errdetail("Remote message: %s", remoteMessage)));
+	/*
+	 * If requested, actually raise an error. This necessitates purging the
+	 * connection so it doesn't remain in the hash in an invalid state.
+	 */
+	if (raiseError)
+	{
+		errorLevel = ERROR;
+		PurgeConnection(connection);
+	}
+
+	if (sqlState == ERRCODE_CONNECTION_FAILURE)
+	{
+		ereport(errorLevel, (errcode(sqlState),
+							 errmsg("connection failed to %s:%s", nodeName, nodePort),
+							 errdetail("%s", messagePrimary)));
+	}
+	else
+	{
+		ereport(errorLevel, (errcode(sqlState), errmsg("%s", messagePrimary),
+							 messageDetail ? errdetail("%s", messageDetail) : 0,
+							 messageHint ? errhint("%s", messageHint) : 0,
+							 messageContext ? errcontext("%s", messageContext) : 0,
+							 errcontext("while executing command on %s:%s",
+										nodeName, nodePort)));
+	}
 }
 
 
@@ -306,7 +384,7 @@ ConnectToNode(char *nodeName, int32 nodePort, char *nodeUser)
 			/* warn if still erroring on final attempt */
 			if (attemptIndex == MAX_CONNECT_ATTEMPTS - 1)
 			{
-				ReportRemoteError(connection, NULL);
+				WarnRemoteError(connection, NULL);
 			}
 
 			PQfinish(connection);

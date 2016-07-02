@@ -69,13 +69,14 @@ master_create_empty_shard(PG_FUNCTION_ARGS)
 {
 	text *relationNameText = PG_GETARG_TEXT_P(0);
 	char *relationName = text_to_cstring(relationNameText);
+	List *workerNodeList = WorkerNodeList();
 	Datum shardIdDatum = 0;
 	int64 shardId = INVALID_SHARD_ID;
 	List *ddlEventList = NULL;
 	uint32 attemptableNodeCount = 0;
 	uint32 liveNodeCount = 0;
 
-	uint32 candidateNodeCount = 0;
+	uint32 candidateNodeIndex = 0;
 	List *candidateNodeList = NIL;
 	text *nullMinValue = NULL;
 	text *nullMaxValue = NULL;
@@ -83,14 +84,30 @@ master_create_empty_shard(PG_FUNCTION_ARGS)
 	char storageType = SHARD_STORAGE_TABLE;
 
 	Oid relationId = ResolveRelationId(relationNameText);
+	char relationKind = get_rel_relkind(relationId);
 	char *relationOwner = TableOwner(relationId);
 
 	EnsureTablePermissions(relationId, ACL_INSERT);
 	CheckDistributedTable(relationId);
 
-	if (CStoreTable(relationId))
+	/*
+	 * We check whether the table is a foreign table or not. If it is, we set
+	 * storage type as foreign also. Only exception is if foreign table is a
+	 * foreign cstore table, in this case we set storage type as columnar.
+	 *
+	 * i.e. While setting storage type, columnar has priority over foreign.
+	 */
+	if (relationKind == RELKIND_FOREIGN_TABLE)
 	{
-		storageType = SHARD_STORAGE_COLUMNAR;
+		bool cstoreTable = cstoreTable = CStoreTable(relationId);
+		if (cstoreTable)
+		{
+			storageType = SHARD_STORAGE_COLUMNAR;
+		}
+		else
+		{
+			storageType = SHARD_STORAGE_FOREIGN;
+		}
 	}
 
 	partitionMethod = PartitionMethod(relationId);
@@ -118,17 +135,36 @@ master_create_empty_shard(PG_FUNCTION_ARGS)
 	}
 
 	/* first retrieve a list of random nodes for shard placements */
-	while (candidateNodeCount < attemptableNodeCount)
+	while (candidateNodeIndex < attemptableNodeCount)
 	{
-		WorkerNode *candidateNode = WorkerGetCandidateNode(candidateNodeList);
+		WorkerNode *candidateNode = NULL;
+
+		if (ShardPlacementPolicy == SHARD_PLACEMENT_LOCAL_NODE_FIRST)
+		{
+			candidateNode = WorkerGetLocalFirstCandidateNode(candidateNodeList);
+		}
+		else if (ShardPlacementPolicy == SHARD_PLACEMENT_ROUND_ROBIN)
+		{
+			candidateNode = WorkerGetRoundRobinCandidateNode(workerNodeList, shardId,
+															 candidateNodeIndex);
+		}
+		else if (ShardPlacementPolicy == SHARD_PLACEMENT_RANDOM)
+		{
+			candidateNode = WorkerGetRandomCandidateNode(candidateNodeList);
+		}
+		else
+		{
+			ereport(ERROR, (errmsg("unrecognized shard placement policy")));
+		}
+
 		if (candidateNode == NULL)
 		{
 			ereport(ERROR, (errmsg("could only find %u of %u possible nodes",
-								   candidateNodeCount, attemptableNodeCount)));
+								   candidateNodeIndex, attemptableNodeCount)));
 		}
 
 		candidateNodeList = lappend(candidateNodeList, candidateNode);
-		candidateNodeCount++;
+		candidateNodeIndex++;
 	}
 
 	CreateShardPlacements(shardId, ddlEventList, relationOwner,
@@ -155,10 +191,14 @@ master_append_table_to_shard(PG_FUNCTION_ARGS)
 	text *sourceTableNameText = PG_GETARG_TEXT_P(1);
 	text *sourceNodeNameText = PG_GETARG_TEXT_P(2);
 	uint32 sourceNodePort = PG_GETARG_UINT32(3);
+
 	char *sourceTableName = text_to_cstring(sourceTableNameText);
 	char *sourceNodeName = text_to_cstring(sourceNodeNameText);
 
-	char *shardName = NULL;
+	Oid shardSchemaOid = 0;
+	char *shardSchemaName = NULL;
+	char *shardTableName = NULL;
+	char *shardQualifiedName = NULL;
 	List *shardPlacementList = NIL;
 	List *succeededPlacementList = NIL;
 	List *failedPlacementList = NIL;
@@ -198,13 +238,19 @@ master_append_table_to_shard(PG_FUNCTION_ARGS)
 	 */
 	LockShardResource(shardId, AccessExclusiveLock);
 
+	/* get schame name of the target shard */
+	shardSchemaOid = get_rel_namespace(relationId);
+	shardSchemaName = get_namespace_name(shardSchemaOid);
+
 	/* if shard doesn't have an alias, extend regular table name */
-	shardName = LoadShardAlias(relationId, shardId);
-	if (shardName == NULL)
+	shardTableName = LoadShardAlias(relationId, shardId);
+	if (shardTableName == NULL)
 	{
-		shardName = get_rel_name(relationId);
-		AppendShardIdToName(&shardName, shardId);
+		shardTableName = get_rel_name(relationId);
+		AppendShardIdToName(&shardTableName, shardId);
 	}
+
+	shardQualifiedName = quote_qualified_identifier(shardSchemaName, shardTableName);
 
 	shardPlacementList = FinalizedShardPlacementList(shardId);
 	if (shardPlacementList == NIL)
@@ -224,7 +270,7 @@ master_append_table_to_shard(PG_FUNCTION_ARGS)
 
 		StringInfo workerAppendQuery = makeStringInfo();
 		appendStringInfo(workerAppendQuery, WORKER_APPEND_TABLE_TO_SHARD,
-						 quote_literal_cstr(shardName),
+						 quote_literal_cstr(shardQualifiedName),
 						 quote_literal_cstr(sourceTableName),
 						 quote_literal_cstr(sourceNodeName), sourceNodePort);
 
@@ -263,7 +309,8 @@ master_append_table_to_shard(PG_FUNCTION_ARGS)
 								workerName, workerPort);
 
 		ereport(WARNING, (errmsg("could not append table to shard \"%s\" on node "
-								 "\"%s:%u\"", shardName, workerName, workerPort),
+								 "\"%s:%u\"", shardQualifiedName, workerName,
+								 workerPort),
 						  errdetail("Marking this shard placement as inactive")));
 	}
 
@@ -427,6 +474,7 @@ UpdateShardStatistics(int64 shardId)
 	ShardInterval *shardInterval = LoadShardInterval(shardId);
 	Oid relationId = shardInterval->relationId;
 	char storageType = shardInterval->storageType;
+	char partitionType = PartitionMethod(relationId);
 	char *shardQualifiedName = NULL;
 	List *shardPlacementList = NIL;
 	ListCell *shardPlacementCell = NULL;
@@ -439,14 +487,14 @@ UpdateShardStatistics(int64 shardId)
 	shardQualifiedName = LoadShardAlias(relationId, shardId);
 	if (shardQualifiedName == NULL)
 	{
-		char *relationName = get_rel_name(relationId);
+		char *shardName = get_rel_name(relationId);
 
 		Oid schemaId = get_rel_namespace(relationId);
 		char *schemaName = get_namespace_name(schemaId);
 
-		shardQualifiedName = quote_qualified_identifier(schemaName, relationName);
+		AppendShardIdToName(&shardName, shardId);
 
-		AppendShardIdToName(&shardQualifiedName, shardId);
+		shardQualifiedName = quote_qualified_identifier(schemaName, shardName);
 	}
 
 	shardPlacementList = FinalizedShardPlacementList(shardId);
@@ -496,8 +544,12 @@ UpdateShardStatistics(int64 shardId)
 								workerName, workerPort);
 	}
 
-	DeleteShardRow(shardId);
-	InsertShardRow(relationId, shardId, storageType, minValue, maxValue);
+	/* only update shard min/max values for append-partitioned tables */
+	if (partitionType == DISTRIBUTE_BY_APPEND)
+	{
+		DeleteShardRow(shardId);
+		InsertShardRow(relationId, shardId, storageType, minValue, maxValue);
+	}
 
 	if (QueryCancelPending)
 	{
@@ -555,16 +607,18 @@ WorkerTableSize(char *nodeName, uint32 nodePort, Oid relationId, char *tableName
 	List *queryResultList = NIL;
 	StringInfo tableSizeString = NULL;
 	char *tableSizeStringEnd = NULL;
+	char *quotedTableName = quote_literal_cstr(tableName);
 	bool cstoreTable = CStoreTable(relationId);
 	StringInfo tableSizeQuery = makeStringInfo();
 
+
 	if (cstoreTable)
 	{
-		appendStringInfo(tableSizeQuery, SHARD_CSTORE_TABLE_SIZE_QUERY, tableName);
+		appendStringInfo(tableSizeQuery, SHARD_CSTORE_TABLE_SIZE_QUERY, quotedTableName);
 	}
 	else
 	{
-		appendStringInfo(tableSizeQuery, SHARD_TABLE_SIZE_QUERY, tableName);
+		appendStringInfo(tableSizeQuery, SHARD_TABLE_SIZE_QUERY, quotedTableName);
 	}
 
 	queryResultList = ExecuteRemoteQuery(nodeName, nodePort, NULL, tableSizeQuery);
@@ -581,7 +635,7 @@ WorkerTableSize(char *nodeName, uint32 nodePort, Oid relationId, char *tableName
 	if (errno != 0 || (*tableSizeStringEnd) != '\0')
 	{
 		ereport(ERROR, (errmsg("could not extract table size for table \"%s\"",
-							   tableName)));
+							   quotedTableName)));
 	}
 
 	return tableSize;

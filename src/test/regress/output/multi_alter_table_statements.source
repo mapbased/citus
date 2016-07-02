@@ -1,10 +1,11 @@
 --
 -- MULTI_ALTER_TABLE_STATEMENTS
 --
+ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 220000;
+ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 220000;
 -- Check that we can run ALTER TABLE statements on distributed tables.
 -- We set the shardid sequence here so that the shardids in this test
 -- aren't affected by changes to the previous tests.
-ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 103000;
 CREATE TABLE lineitem_alter (
 	l_orderkey bigint not null,
 	l_partkey integer not null,
@@ -166,10 +167,10 @@ ALTER TABLE lineitem_alter ALTER COLUMN int_column2 DROP DEFAULT;
 \STAGE lineitem_alter (l_orderkey, l_partkey, l_suppkey, l_linenumber, l_quantity, l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment) FROM '@abs_srcdir@/data/lineitem.1.data' with delimiter '|'
 ERROR:  null value in column "int_column2" violates not-null constraint
 DETAIL:  Failing row contains (1, 155190, 7706, 1, 17.00, 21168.23, 0.04, 0.02, N, O, 03-13-1996, 02-12-1996, 03-22-1996, DELIVER IN PERSON        , TRUCK     , egular courts above the, 1, null, null, null, null).
-CONTEXT:  COPY lineitem_alter_103006, line 1: "1|155190|7706|1|17|21168.23|0.04|0.02|N|O|1996-03-13|1996-02-12|1996-03-22|DELIVER IN PERSON|TRUCK|e..."
+CONTEXT:  COPY lineitem_alter_220006, line 1: "1|155190|7706|1|17|21168.23|0.04|0.02|N|O|1996-03-13|1996-02-12|1996-03-22|DELIVER IN PERSON|TRUCK|e..."
 ERROR:  null value in column "int_column2" violates not-null constraint
 DETAIL:  Failing row contains (1, 155190, 7706, 1, 17.00, 21168.23, 0.04, 0.02, N, O, 03-13-1996, 02-12-1996, 03-22-1996, DELIVER IN PERSON        , TRUCK     , egular courts above the, 1, null, null, null, null).
-CONTEXT:  COPY lineitem_alter_103006, line 1: "1|155190|7706|1|17|21168.23|0.04|0.02|N|O|1996-03-13|1996-02-12|1996-03-22|DELIVER IN PERSON|TRUCK|e..."
+CONTEXT:  COPY lineitem_alter_220006, line 1: "1|155190|7706|1|17|21168.23|0.04|0.02|N|O|1996-03-13|1996-02-12|1996-03-22|DELIVER IN PERSON|TRUCK|e..."
 \stage: failed to replicate shard to enough replicas
 -- Verify that DROP NOT NULL works
 ALTER TABLE lineitem_alter ALTER COLUMN int_column2 DROP NOT NULL;
@@ -260,8 +261,8 @@ ALTER TABLE IF EXISTS non_existent_table ADD COLUMN new_column INTEGER;
 NOTICE:  relation "non_existent_table" does not exist, skipping
 ALTER TABLE IF EXISTS lineitem_alter ALTER COLUMN int_column2 SET DATA TYPE INTEGER;
 ALTER TABLE lineitem_alter DROP COLUMN non_existent_column;
-WARNING:  could not receive query results from localhost:57638
-DETAIL:  Client error: column "non_existent_column" of relation "lineitem_alter_103000" does not exist
+WARNING:  column "non_existent_column" of relation "lineitem_alter_220000" does not exist
+CONTEXT:  while executing command on localhost:57638
 ERROR:  could not execute DDL command on worker node shards
 ALTER TABLE lineitem_alter DROP COLUMN IF EXISTS non_existent_column;
 NOTICE:  column "non_existent_column" of relation "lineitem_alter" does not exist, skipping
@@ -360,16 +361,16 @@ DETAIL:  Only ADD|DROP COLUMN, SET|DROP NOT NULL, SET|DROP DEFAULT and TYPE subc
 -- Verify that we error out in case of postgres errors on supported statement
 -- types
 ALTER TABLE lineitem_alter ADD COLUMN new_column non_existent_type;
-WARNING:  could not receive query results from localhost:57638
-DETAIL:  Client error: type "non_existent_type" does not exist
+WARNING:  type "non_existent_type" does not exist
+CONTEXT:  while executing command on localhost:57638
 ERROR:  could not execute DDL command on worker node shards
 ALTER TABLE lineitem_alter ALTER COLUMN null_column SET NOT NULL;
-WARNING:  could not receive query results from localhost:57638
-DETAIL:  Client error: column "null_column" contains null values
+WARNING:  column "null_column" contains null values
+CONTEXT:  while executing command on localhost:57638
 ERROR:  could not execute DDL command on worker node shards
 ALTER TABLE lineitem_alter ALTER COLUMN l_partkey SET DEFAULT 'a';
-WARNING:  could not receive query results from localhost:57638
-DETAIL:  Client error: invalid input syntax for integer: "a"
+WARNING:  invalid input syntax for integer: "a"
+CONTEXT:  while executing command on localhost:57638
 ERROR:  could not execute DDL command on worker node shards
 -- Verify that we error out on statements involving RENAME
 ALTER TABLE lineitem_alter RENAME TO lineitem_renamed;
@@ -452,7 +453,73 @@ ORDER BY attnum;
 (29 rows)
 
 \c - - - :master_port
+-- verify that we don't intercept DDL commands if propagation is turned off
+SET citus.enable_ddl_propagation to false;
+-- table rename statement can be performed now
+ALTER TABLE lineitem_alter RENAME TO lineitem_renamed;
+-- verify rename is performed
+SELECT relname FROM pg_class WHERE relname = 'lineitem_alter' or relname = 'lineitem_renamed';
+     relname      
+------------------
+ lineitem_renamed
+(1 row)
+
+-- revert it to original name
+ALTER TABLE lineitem_renamed RENAME TO lineitem_alter;
+-- this column is added to master table and not workers
+ALTER TABLE lineitem_alter ADD COLUMN column_only_added_to_master int;
+-- verify newly added column is not present in a worker shard
+\c - - - :worker_1_port
+SELECT column_only_added_to_master FROM lineitem_alter_220000 LIMIT 0;
+ERROR:  column "column_only_added_to_master" does not exist
+LINE 1: SELECT column_only_added_to_master FROM lineitem_alter_22000...
+               ^
+\c - - - :master_port
+-- ddl propagation flag is reset to default, disable it again
+SET citus.enable_ddl_propagation to false;
+-- following query succeeds since it accesses an previously existing column
+SELECT l_orderkey FROM lineitem_alter LIMIT 0;
+ l_orderkey 
+------------
+(0 rows)
+
+-- make master and workers have the same schema again
+ALTER TABLE lineitem_alter DROP COLUMN column_only_added_to_master;
+-- now this should succeed
+SELECT * FROM lineitem_alter LIMIT 0;
+ l_orderkey | l_partkey | l_suppkey | l_linenumber | l_quantity | l_extendedprice | l_discount | l_tax | l_returnflag | l_linestatus | l_shipdate | l_commitdate | l_receiptdate | l_shipinstruct | l_shipmode | l_comment | null_column 
+------------+-----------+-----------+--------------+------------+-----------------+------------+-------+--------------+--------------+------------+--------------+---------------+----------------+------------+-----------+-------------
+(0 rows)
+
+-- previously unsupported statements are accepted by postgresql now
+ALTER TABLE lineitem_alter ALTER COLUMN l_orderkey SET STATISTICS 100;
+ALTER TABLE lineitem_alter DROP CONSTRAINT IF EXISTS non_existent_contraint;
+NOTICE:  constraint "non_existent_contraint" of relation "lineitem_alter" does not exist, skipping
+ALTER TABLE lineitem_alter SET WITHOUT OIDS;
+-- even distribution column can be dropped however postgresql prevents this.
+ALTER TABLE lineitem_alter DROP COLUMN l_orderkey;
+ERROR:  cannot drop table lineitem_alter column l_orderkey because other objects depend on it
+DETAIL:  table lineitem_alter depends on table lineitem_alter column l_orderkey
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+-- Even unique indexes on l_partkey (non-partition column) are allowed.
+-- Citus would have prevented that.
+CREATE UNIQUE INDEX unique_lineitem_partkey on lineitem_alter(l_partkey);
+SELECT  indexname, tablename FROM pg_indexes WHERE tablename = 'lineitem_alter';
+        indexname        |   tablename    
+-------------------------+----------------
+ unique_lineitem_partkey | lineitem_alter
+(1 row)
+
+-- verify index is not created on worker
+\c - - - :worker_1_port
+SELECT  indexname, tablename FROM pg_indexes WHERE tablename like 'lineitem_alter_%';
+ indexname | tablename 
+-----------+-----------
+(0 rows)
+
+\c - - - :master_port
 -- Cleanup the table and its shards
+SET citus.enable_ddl_propagation to true;
 SELECT master_apply_delete_command('DELETE FROM lineitem_alter');
  master_apply_delete_command 
 -----------------------------

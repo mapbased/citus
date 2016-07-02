@@ -2,6 +2,11 @@
 -- MULTI_EXPLAIN
 --
 
+
+ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 570000;
+ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 570000;
+
+
 \a\t
 
 SET citus.task_executor_type TO 'real-time';
@@ -73,8 +78,8 @@ EXPLAIN (COSTS FALSE, VERBOSE TRUE)
 -- Test join
 EXPLAIN (COSTS FALSE)
 	SELECT * FROM lineitem
-	JOIN orders ON l_orderkey = o_orderkey AND l_quantity < 5
-	ORDER BY l_quantity DESC LIMIT 10;
+	JOIN orders ON l_orderkey = o_orderkey AND l_quantity < 5.0
+	ORDER BY l_quantity LIMIT 10;
 
 -- Test insert
 EXPLAIN (COSTS FALSE)

@@ -30,7 +30,8 @@
 #define UPSERT_ALIAS "citus_table_alias"
 #endif
 
-extern MultiPlan * MultiRouterPlanCreate(Query *query);
-extern bool MultiRouterPlannableQuery(Query *query, MultiExecutorType taskExecutorType);
+extern MultiPlan * MultiRouterPlanCreate(Query *query,
+										 MultiExecutorType taskExecutorType);
+extern void ErrorIfModifyQueryNotSupported(Query *queryTree);
 
 #endif /* MULTI_ROUTER_PLANNER_H */

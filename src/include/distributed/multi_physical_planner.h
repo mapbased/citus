@@ -14,6 +14,7 @@
 #ifndef MULTI_PHYSICAL_PLANNER_H
 #define MULTI_PHYSICAL_PLANNER_H
 
+#include "datatype/timestamp.h"
 #include "distributed/citus_nodes.h"
 #include "distributed/master_metadata_utility.h"
 #include "distributed/multi_logical_planner.h"
@@ -41,7 +42,7 @@
 #define MERGE_FILES_INTO_TABLE_COMMAND "SELECT worker_merge_files_into_table \
  (" UINT64_FORMAT ", %d, '%s', '%s')"
 #define MERGE_FILES_AND_RUN_QUERY_COMMAND \
-	"SELECT worker_merge_files_and_run_query(" UINT64_FORMAT ", %d, '%s', '%s')"
+	"SELECT worker_merge_files_and_run_query(" UINT64_FORMAT ", %d, %s, %s)"
 
 
 typedef enum CitusRTEKind

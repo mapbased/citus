@@ -59,7 +59,6 @@ static bool HasComplexJoinOrder(Query *queryTree);
 static bool HasComplexRangeTableType(Query *queryTree);
 static void ValidateClauseList(List *clauseList);
 static bool ExtractFromExpressionWalker(Node *node, List **qualifierList);
-static bool IsJoinClause(Node *clause);
 static List * MultiTableNodeList(List *tableEntryList, List *rangeTableList);
 static List * AddMultiCollectNodes(List *tableNodeList);
 static MultiNode * MultiJoinTree(List *joinOrderList, List *collectTableList,
@@ -834,8 +833,13 @@ ExtractFromExpressionWalker(Node *node, List **qualifierList)
 		List *joinQualifierList = NIL;
 		JoinExpr *joinExpression = (JoinExpr *) node;
 		Node *joinQualifiersNode = joinExpression->quals;
+		JoinType joinType = joinExpression->jointype;
 
-		if (joinQualifiersNode != NULL)
+		/*
+		 * We only extract qualifiers from inner join clauses, which can be
+		 * treated as WHERE clauses.
+		 */
+		if (joinQualifiersNode != NULL && joinType == JOIN_INNER)
 		{
 			if (IsA(joinQualifiersNode, List))
 			{
@@ -888,7 +892,7 @@ ExtractFromExpressionWalker(Node *node, List **qualifierList)
  * criteria. Our criteria defines a join clause as an equi join operator between
  * two columns that belong to two different tables.
  */
-static bool
+bool
 IsJoinClause(Node *clause)
 {
 	bool isJoinClause = false;
@@ -928,15 +932,8 @@ IsJoinClause(Node *clause)
 		bool equiJoin = false;
 		bool joinBetweenDifferentTables = false;
 
-		/*
-		 * We accept all column types that can be joined with an equals sign as
-		 * valid. These include columns that have cross-type equals operators
-		 * (such as int48eq) and columns that can be casted at run-time (such as
-		 * from numeric to int4).
-		 */
-		char *operatorName = get_opname(operatorExpression->opno);
-		int equalsOperator = strncmp(operatorName, EQUAL_OPERATOR_STRING, NAMEDATALEN);
-		if (equalsOperator == 0)
+		bool equalsOperator = OperatorImplementsEquality(operatorExpression->opno);
+		if (equalsOperator)
 		{
 			equiJoin = true;
 		}
@@ -1955,4 +1952,30 @@ MultiSubqueryPushdownTable(RangeTblEntry *subqueryRangeTableEntry)
 	subqueryTableNode->referenceNames = subqueryRangeTableEntry->eref;
 
 	return subqueryTableNode;
+}
+
+
+/*
+ * OperatorImplementsEquality returns true if the given opno represents an
+ * equality operator. The function retrieves btree interpretation list for this
+ * opno and check if BTEqualStrategyNumber strategy is present.
+ */
+bool
+OperatorImplementsEquality(Oid opno)
+{
+	bool equalityOperator = false;
+	List *btreeIntepretationList = get_op_btree_interpretation(opno);
+	ListCell *btreeInterpretationCell = NULL;
+	foreach(btreeInterpretationCell, btreeIntepretationList)
+	{
+		OpBtreeInterpretation *btreeIntepretation = (OpBtreeInterpretation *)
+													lfirst(btreeInterpretationCell);
+		if (btreeIntepretation->strategy == BTEqualStrategyNumber)
+		{
+			equalityOperator = true;
+			break;
+		}
+	}
+
+	return equalityOperator;
 }

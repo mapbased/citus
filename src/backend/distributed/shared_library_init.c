@@ -48,6 +48,7 @@ static void RegisterCitusConfigVariables(void);
 static void NormalizeWorkerListPath(void);
 
 
+/* *INDENT-OFF* */
 /* GUC enum definitions */
 static const struct config_enum_entry task_assignment_policy_options[] = {
 	{ "greedy", TASK_ASSIGNMENT_GREEDY, false },
@@ -65,6 +66,7 @@ static const struct config_enum_entry task_executor_type_options[] = {
 static const struct config_enum_entry shard_placement_policy_options[] = {
 	{ "local-node-first", SHARD_PLACEMENT_LOCAL_NODE_FIRST, false },
 	{ "round-robin", SHARD_PLACEMENT_ROUND_ROBIN, false },
+	{ "random", SHARD_PLACEMENT_RANDOM, false },
 	{ NULL, 0, false }
 };
 
@@ -73,6 +75,8 @@ static const struct config_enum_entry multi_shard_commit_protocol_options[] = {
 	{ "2pc", COMMIT_PROTOCOL_2PC, false },
 	{ NULL, 0, false }
 };
+
+/* *INDENT-ON* */
 
 
 /* shared library initialization function */
@@ -307,6 +311,16 @@ RegisterCitusConfigVariables(void)
 		0,
 		NULL, NULL, NULL);
 
+	DefineCustomBoolVariable(
+		"citus.enable_ddl_propagation",
+		gettext_noop("Enables propagating DDL statements to worker shards"),
+		NULL,
+		&EnableDDLPropagation,
+		true,
+		PGC_USERSET,
+		0,
+		NULL, NULL, NULL);
+
 	DefineCustomIntVariable(
 		"citus.shard_replication_factor",
 		gettext_noop("Sets the replication factor for shards."),
@@ -530,7 +544,8 @@ RegisterCitusConfigVariables(void)
 					 "selecting these nodes. The local-node-first policy places the "
 					 "first replica on the client node and chooses others randomly. "
 					 "The round-robin policy aims to distribute shards evenly across "
-					 "the cluster by selecting nodes in a round-robin fashion."),
+					 "the cluster by selecting nodes in a round-robin fashion."
+					 "The random policy picks all workers randomly."),
 		&ShardPlacementPolicy,
 		SHARD_PLACEMENT_ROUND_ROBIN, shard_placement_policy_options,
 		PGC_USERSET,

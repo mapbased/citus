@@ -55,8 +55,8 @@
 	"SELECT worker_append_table_to_shard (%s, %s, %s, %u)"
 #define SHARD_MIN_VALUE_QUERY "SELECT min(%s) FROM %s"
 #define SHARD_MAX_VALUE_QUERY "SELECT max(%s) FROM %s"
-#define SHARD_TABLE_SIZE_QUERY "SELECT pg_table_size('%s')"
-#define SHARD_CSTORE_TABLE_SIZE_QUERY "SELECT cstore_table_size('%s')"
+#define SHARD_TABLE_SIZE_QUERY "SELECT pg_table_size(%s)"
+#define SHARD_CSTORE_TABLE_SIZE_QUERY "SELECT cstore_table_size(%s)"
 #define DROP_REGULAR_TABLE_COMMAND "DROP TABLE IF EXISTS %s"
 #define DROP_FOREIGN_TABLE_COMMAND "DROP FOREIGN TABLE IF EXISTS %s"
 #define CREATE_SCHEMA_COMMAND "CREATE SCHEMA IF NOT EXISTS %s"
@@ -67,13 +67,13 @@
 	"SELECT master_update_shard_statistics(%ld)"
 #define PARTITION_METHOD_QUERY "SELECT part_method FROM master_get_table_metadata('%s');"
 
-
 /* Enumeration that defines the shard placement policy to use while staging */
 typedef enum
 {
 	SHARD_PLACEMENT_INVALID_FIRST = 0,
 	SHARD_PLACEMENT_LOCAL_NODE_FIRST = 1,
-	SHARD_PLACEMENT_ROUND_ROBIN = 2
+	SHARD_PLACEMENT_ROUND_ROBIN = 2,
+	SHARD_PLACEMENT_RANDOM = 3
 } ShardPlacementPolicyType;
 
 
@@ -107,6 +107,7 @@ extern Datum master_create_empty_shard(PG_FUNCTION_ARGS);
 extern Datum master_append_table_to_shard(PG_FUNCTION_ARGS);
 extern Datum master_update_shard_statistics(PG_FUNCTION_ARGS);
 extern Datum master_apply_delete_command(PG_FUNCTION_ARGS);
+extern Datum master_modify_multiple_shards(PG_FUNCTION_ARGS);
 extern Datum master_drop_all_shards(PG_FUNCTION_ARGS);
 
 /* function declarations for shard creation functionality */

@@ -22,8 +22,6 @@
 #include "nodes/pg_list.h"
 
 
-/* Defines the operator string used for equi joins */
-#define EQUAL_OPERATOR_STRING "="
 #define SUBQUERY_RANGE_TABLE_ID -1
 #define SUBQUERY_RELATION_ID 10000
 #define HEAP_ANALYTICS_SUBQUERY_RELATION_ID 10001
@@ -194,6 +192,7 @@ extern bool BinaryOperator(MultiNode *node);
 extern List * OutputTableIdList(MultiNode *multiNode);
 extern List * FindNodesOfType(MultiNode *node, int type);
 extern List * JoinClauseList(List *whereClauseList);
+extern bool IsJoinClause(Node *clause);
 extern List * SubqueryEntryList(Query *queryTree);
 extern bool ExtractRangeTableIndexWalker(Node *node, List **rangeTableIndexList);
 extern List * WhereClauseList(FromExpr *fromExpr);
@@ -201,6 +200,7 @@ extern List * TableEntryList(List *rangeTableList);
 extern bool ExtractRangeTableRelationWalker(Node *node, List **rangeTableList);
 extern bool ExtractRangeTableEntryWalker(Node *node, List **rangeTableList);
 extern List * pull_var_clause_default(Node *node);
+extern bool OperatorImplementsEquality(Oid opno);
 
 
 #endif   /* MULTI_LOGICAL_PLANNER_H */

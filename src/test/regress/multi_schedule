@@ -3,6 +3,10 @@
 #
 # Regression tests that exercise distributed planning/execution functionality.
 #
+# All new regression tests are expected to be run by this schedule. Tests that
+# do not set specific task executor type should also be added to 
+# multi_task_tracker_extra_schedule.
+#
 # Note that we use variant comparison files to test version dependent regression
 # test results. For more information:
 # http://www.postgresql.org/docs/9.5/static/regress-variant.html
@@ -71,7 +75,9 @@ test: multi_large_table_task_assignment
 # ----------
 # Tests to check our large record staging and shard deletion behavior
 # ----------
-test: multi_stage_large_records multi_master_delete_protocol
+test: multi_stage_large_records
+test: multi_master_delete_protocol
+test: multi_shard_modify
 
 # ----------
 # Tests around DDL statements run on distributed tables
@@ -106,10 +112,11 @@ test: multi_outer_join
 # Tests covering mostly modification queries and required preliminary
 # functionality related to metadata, shard creation, shard pruning and
 # "hacky" copy script for hash partitioned tables.
-# Note that the order of the following tests are important.
+# Note that the order of the following tests are important. multi_complex_count_distinct
+# is independed from the rest of the group, it is added to increase parallelism.
 # ---
 test: multi_create_fdw
-test: multi_connection_cache
+test: multi_connection_cache multi_complex_count_distinct
 test: multi_distribution_metadata
 test: multi_generate_ddl_commands
 test: multi_create_shards
@@ -142,3 +149,8 @@ test: multi_large_shardid
 # multi_drop_extension makes sure we can safely drop and recreate the extension
 # ----------
 test: multi_drop_extension
+
+# ----------
+# multi_schema_support makes sure we can work with tables in schemas other than public with no problem
+# ----------
+test: multi_schema_support

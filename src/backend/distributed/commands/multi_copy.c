@@ -51,6 +51,8 @@
 #include "miscadmin.h"
 #include "plpgsql.h"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <string.h>
 
 #include "access/heapam.h"
@@ -125,22 +127,11 @@
 #include "utils/memutils.h"
 
 
-#define INITIAL_CONNECTION_CACHE_SIZE 1001
-
-
 /* constant used in binary protocol */
 static const char BinarySignature[11] = "PGCOPY\n\377\r\n\0";
 
 /* use a global connection to the master node in order to skip passing it around */
 static PGconn *masterConnection = NULL;
-
-
-/* ShardConnections represents a set of connections for each placement of a shard */
-typedef struct ShardConnections
-{
-	int64 shardId;
-	List *connectionList;
-} ShardConnections;
 
 
 /* Local functions forward declarations */
@@ -149,12 +140,6 @@ static void CopyToExistingShards(CopyStmt *copyStatement, char *completionTag);
 static void CopyToNewShards(CopyStmt *copyStatement, char *completionTag, Oid relationId);
 static char MasterPartitionMethod(RangeVar *relation);
 static void RemoveMasterOptions(CopyStmt *copyStatement);
-static void LockAllShards(List *shardIntervalList);
-static HTAB * CreateShardConnectionHash(void);
-static int CompareShardIntervalsById(const void *leftElement, const void *rightElement);
-static ShardConnections * GetShardConnections(HTAB *shardConnectionHash,
-											  int64 shardId,
-											  bool *shardConnectionsFound);
 static void OpenCopyTransactions(CopyStmt *copyStatement,
 								 ShardConnections *shardConnections, bool stopOnFailure);
 static List * MasterShardPlacementList(uint64 shardId);
@@ -165,7 +150,6 @@ static StringInfo ConstructCopyStatement(CopyStmt *copyStatement, int64 shardId)
 static void SendCopyDataToAll(StringInfo dataBuffer, List *connectionList);
 static void SendCopyDataToPlacement(StringInfo dataBuffer, PGconn *connection,
 									int64 shardId);
-static List * ConnectionList(HTAB *connectionHash);
 static void EndRemoteCopy(List *connectionList, bool stopOnFailure);
 static void ReportCopyError(PGconn *connection, PGresult *result);
 static uint32 AvailableColumnCount(TupleDesc tupleDescriptor);
@@ -432,7 +416,7 @@ CopyToExistingShards(CopyStmt *copyStatement, char *completionTag)
 	}
 
 	/* prevent concurrent placement changes and non-commutative DML statements */
-	LockAllShards(shardIntervalList);
+	LockShards(shardIntervalList, ShareLock);
 
 	/* initialize the shard interval cache */
 	shardCount = cacheEntry->shardIntervalArrayLength;
@@ -843,7 +827,7 @@ MasterPartitionMethod(RangeVar *relation)
 	}
 	else
 	{
-		ReportRemoteError(masterConnection, queryResult);
+		WarnRemoteError(masterConnection, queryResult);
 		ereport(ERROR, (errmsg("could not get the partition method of the "
 							   "distributed table")));
 	}
@@ -880,111 +864,6 @@ RemoveMasterOptions(CopyStmt *copyStatement)
 	}
 
 	copyStatement->options = newOptionList;
-}
-
-
-/*
- * LockAllShards takes shared locks on the metadata and the data of all shards in
- * shardIntervalList. This prevents concurrent placement changes and concurrent
- * DML statements that require an exclusive lock.
- */
-static void
-LockAllShards(List *shardIntervalList)
-{
-	ListCell *shardIntervalCell = NULL;
-
-	/* lock shards in order of shard id to prevent deadlock */
-	shardIntervalList = SortList(shardIntervalList, CompareShardIntervalsById);
-
-	foreach(shardIntervalCell, shardIntervalList)
-	{
-		ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
-		int64 shardId = shardInterval->shardId;
-
-		/* prevent concurrent changes to number of placements */
-		LockShardDistributionMetadata(shardId, ShareLock);
-
-		/* prevent concurrent update/delete statements */
-		LockShardResource(shardId, ShareLock);
-	}
-}
-
-
-/*
- * CreateShardConnectionHash constructs a hash table used for shardId->Connection
- * mapping.
- */
-static HTAB *
-CreateShardConnectionHash(void)
-{
-	HTAB *shardConnectionsHash = NULL;
-	int hashFlags = 0;
-	HASHCTL info;
-
-	memset(&info, 0, sizeof(info));
-	info.keysize = sizeof(int64);
-	info.entrysize = sizeof(ShardConnections);
-	info.hash = tag_hash;
-
-	hashFlags = HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT;
-	shardConnectionsHash = hash_create("Shard Connections Hash",
-									   INITIAL_CONNECTION_CACHE_SIZE, &info,
-									   hashFlags);
-
-	return shardConnectionsHash;
-}
-
-
-/*
- * CompareShardIntervalsById is a comparison function for sort shard
- * intervals by their shard ID.
- */
-static int
-CompareShardIntervalsById(const void *leftElement, const void *rightElement)
-{
-	ShardInterval *leftInterval = *((ShardInterval **) leftElement);
-	ShardInterval *rightInterval = *((ShardInterval **) rightElement);
-	int64 leftShardId = leftInterval->shardId;
-	int64 rightShardId = rightInterval->shardId;
-
-	/* we compare 64-bit integers, instead of casting their difference to int */
-	if (leftShardId > rightShardId)
-	{
-		return 1;
-	}
-	else if (leftShardId < rightShardId)
-	{
-		return -1;
-	}
-	else
-	{
-		return 0;
-	}
-}
-
-
-/*
- * GetShardConnections finds existing connections for a shard in the hash
- * or opens new connections to each active placement and starts a (binary) COPY
- * transaction on each of them.
- */
-static ShardConnections *
-GetShardConnections(HTAB *shardConnectionHash, int64 shardId,
-					bool *shardConnectionsFound)
-{
-	ShardConnections *shardConnections = NULL;
-
-	shardConnections = (ShardConnections *) hash_search(shardConnectionHash,
-														&shardId,
-														HASH_ENTER,
-														shardConnectionsFound);
-	if (!*shardConnectionsFound)
-	{
-		shardConnections->shardId = shardId;
-		shardConnections->connectionList = NIL;
-	}
-
-	return shardConnections;
 }
 
 
@@ -1045,7 +924,7 @@ OpenCopyTransactions(CopyStmt *copyStatement, ShardConnections *shardConnections
 		result = PQexec(connection, "BEGIN");
 		if (PQresultStatus(result) != PGRES_COMMAND_OK)
 		{
-			ReportRemoteError(connection, result);
+			WarnRemoteError(connection, result);
 			failedPlacementList = lappend(failedPlacementList, placement);
 
 			PQclear(result);
@@ -1058,7 +937,7 @@ OpenCopyTransactions(CopyStmt *copyStatement, ShardConnections *shardConnections
 		result = PQexec(connection, copyCommand->data);
 		if (PQresultStatus(result) != PGRES_COPY_IN)
 		{
-			ReportRemoteError(connection, result);
+			WarnRemoteError(connection, result);
 			failedPlacementList = lappend(failedPlacementList, placement);
 
 			PQclear(result);
@@ -1199,14 +1078,20 @@ static StringInfo
 ConstructCopyStatement(CopyStmt *copyStatement, int64 shardId)
 {
 	StringInfo command = makeStringInfo();
-	char *qualifiedName = NULL;
 
-	qualifiedName = quote_qualified_identifier(copyStatement->relation->schemaname,
-											   copyStatement->relation->relname);
+	char *schemaName = copyStatement->relation->schemaname;
+	char *relationName = copyStatement->relation->relname;
 
-	appendStringInfo(command, "COPY %s_%ld ", qualifiedName, shardId);
+	char *shardName = pstrdup(relationName);
+	char *shardQualifiedName = NULL;
 
-	appendStringInfoString(command, "FROM STDIN WITH (FORMAT BINARY)");
+	AppendShardIdToName(&shardName, shardId);
+
+	shardQualifiedName = quote_qualified_identifier(schemaName, shardName);
+
+	appendStringInfo(command,
+					 "COPY %s FROM STDIN WITH (FORMAT BINARY)",
+					 shardQualifiedName);
 
 	return command;
 }
@@ -1248,31 +1133,6 @@ SendCopyDataToPlacement(StringInfo dataBuffer, PGconn *connection, int64 shardId
 						errmsg("failed to COPY to shard %ld on %s:%s",
 							   shardId, nodeName, nodePort)));
 	}
-}
-
-
-/*
- * ConnectionList flattens the connection hash to a list of placement connections.
- */
-static List *
-ConnectionList(HTAB *connectionHash)
-{
-	List *connectionList = NIL;
-	HASH_SEQ_STATUS status;
-	ShardConnections *shardConnections = NULL;
-
-	hash_seq_init(&status, connectionHash);
-
-	shardConnections = (ShardConnections *) hash_seq_search(&status);
-	while (shardConnections != NULL)
-	{
-		List *shardConnectionsList = list_copy(shardConnections->connectionList);
-		connectionList = list_concat(connectionList, shardConnectionsList);
-
-		shardConnections = (ShardConnections *) hash_seq_search(&status);
-	}
-
-	return connectionList;
 }
 
 
@@ -1650,7 +1510,7 @@ RemoteCreateEmptyShard(char *relationName)
 	}
 	else
 	{
-		ReportRemoteError(masterConnection, queryResult);
+		WarnRemoteError(masterConnection, queryResult);
 		ereport(ERROR, (errmsg("could not create a new empty shard on the remote node")));
 	}
 

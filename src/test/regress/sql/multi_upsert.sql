@@ -2,6 +2,11 @@
 -- note that output of this file for postgresql 9.4 will
 -- be full syntax errors, which is expected.
 
+
+ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 980000;
+ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 980000;
+
+
 CREATE TABLE upsert_test
 (
 	part_key int UNIQUE,
@@ -79,6 +84,15 @@ INSERT INTO upsert_test as ups_test (part_key, other_col) VALUES (1, 1) ON CONFL
 
 -- see the results
 SELECT * FROM upsert_test;
+
+-- Test upsert, with returning:
+INSERT INTO upsert_test (part_key, other_col) VALUES (2, 2)
+	ON CONFLICT (part_key) DO UPDATE SET other_col = 3
+        RETURNING *;
+
+INSERT INTO upsert_test (part_key, other_col) VALUES (2, 2)
+	ON CONFLICT (part_key) DO UPDATE SET other_col = 3
+        RETURNING *;
 
 -- create another table
 CREATE TABLE upsert_test_2

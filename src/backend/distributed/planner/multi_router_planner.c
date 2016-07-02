@@ -56,7 +56,6 @@
 
 
 /* planner functions forward declarations */
-static void ErrorIfModifyQueryNotSupported(Query *queryTree);
 static Task * RouterModifyTask(Query *query);
 #if (PG_VERSION_NUM >= 90500)
 static OnConflictExpr * RebuildOnConflict(Oid relationId,
@@ -71,24 +70,34 @@ static Oid ExtractFirstDistributedTableId(Query *query);
 static Const * ExtractInsertPartitionValue(Query *query, Var *partitionColumn);
 static Task * RouterSelectTask(Query *query);
 static Job * RouterQueryJob(Query *query, Task *task);
+static bool MultiRouterPlannableQuery(Query *query, MultiExecutorType taskExecutorType);
 static bool ColumnMatchExpressionAtTopLevelConjunction(Node *node, Var *column);
+static void SetRangeTablesInherited(Query *query);
 
 
 /*
- * MultiRouterPlanCreate creates a physical plan for given router plannable query.
- * Created plan is either a modify task that changes a single shard, or a router task
- * that returns query results from a single shard. Supported modify queries
- * (insert/update/delete) are router plannble by default. The caller is expected to call
- * MultiRouterPlannableQuery to see if the query is router plannable for select queries.
+ * MultiRouterPlanCreate creates a physical plan for given query. The created plan is
+ * either a modify task that changes a single shard, or a router task that returns
+ * query results from a single shard. Supported modify queries (insert/update/delete)
+ * are router plannable by default. If query is not router plannable then the function
+ * returns NULL.
  */
 MultiPlan *
-MultiRouterPlanCreate(Query *query)
+MultiRouterPlanCreate(Query *query, MultiExecutorType taskExecutorType)
 {
 	Task *task = NULL;
 	Job *job = NULL;
 	MultiPlan *multiPlan = NULL;
 	CmdType commandType = query->commandType;
 	bool modifyTask = false;
+
+	bool routerPlannable = MultiRouterPlannableQuery(query, taskExecutorType);
+	if (!routerPlannable)
+	{
+		return NULL;
+	}
+
+	ereport(DEBUG2, (errmsg("Creating router plan")));
 
 	if (commandType == CMD_INSERT || commandType == CMD_UPDATE ||
 		commandType == CMD_DELETE)
@@ -124,7 +133,7 @@ MultiRouterPlanCreate(Query *query)
  * ErrorIfModifyQueryNotSupported checks if the query contains unsupported features,
  * and errors out if it does.
  */
-static void
+void
 ErrorIfModifyQueryNotSupported(Query *queryTree)
 {
 	Oid distributedTableId = ExtractFirstDistributedTableId(queryTree);
@@ -246,16 +255,6 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 								  "supported.")));
 	}
 
-	/* reject queries with a returning list */
-	if (list_length(queryTree->returningList) > 0)
-	{
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("cannot perform distributed planning for the given"
-							   " modification"),
-						errdetail("RETURNING clauses are not supported in distributed "
-								  "modifications.")));
-	}
-
 	if (commandType == CMD_INSERT || commandType == CMD_UPDATE ||
 		commandType == CMD_DELETE)
 	{
@@ -288,6 +287,11 @@ ErrorIfModifyQueryNotSupported(Query *queryTree)
 		if (joinTree != NULL && contain_mutable_functions(joinTree->quals))
 		{
 			hasNonConstQualExprs = true;
+		}
+
+		if (contain_mutable_functions((Node *) queryTree->returningList))
+		{
+			hasNonConstTargetEntryExprs = true;
 		}
 	}
 
@@ -424,6 +428,12 @@ RouterModifyTask(Query *query)
 	/* always set to false for PG_VERSION_NUM < 90500 */
 	upsertQuery = false;
 #endif
+
+	/*
+	 * We set inh flag of all range tables entries to true so that deparser will not
+	 * add ONLY keyword to resulting query string.
+	 */
+	SetRangeTablesInherited(query);
 
 	deparse_shard_query(query, shardInterval->relationId, shardId, queryString);
 	ereport(DEBUG4, (errmsg("distributed statement: %s", queryString->data)));
@@ -779,6 +789,12 @@ RouterSelectTask(Query *query)
 		joinTree->quals = whereClause;
 	}
 
+	/*
+	 * We set inh flag of all range tables entries to true so that deparser will not
+	 * add ONLY keyword to resulting query string.
+	 */
+	SetRangeTablesInherited(query);
+
 	deparse_shard_query(query, shardInterval->relationId, shardId, queryString);
 	ereport(DEBUG4, (errmsg("distributed statement: %s", queryString->data)));
 
@@ -997,8 +1013,6 @@ ColumnMatchExpressionAtTopLevelConjunction(Node *node, Var *column)
 		OpExpr *opExpr = (OpExpr *) node;
 		bool simpleExpression = SimpleOpExpression((Expr *) opExpr);
 		bool columnInExpr = false;
-		char *operatorName = NULL;
-		int operatorNameComparison = 0;
 		bool usingEqualityOperator = false;
 
 		if (!simpleExpression)
@@ -1012,10 +1026,7 @@ ColumnMatchExpressionAtTopLevelConjunction(Node *node, Var *column)
 			return false;
 		}
 
-		operatorName = get_opname(opExpr->opno);
-		operatorNameComparison = strncmp(operatorName, EQUAL_OPERATOR_STRING,
-										 NAMEDATALEN);
-		usingEqualityOperator = (operatorNameComparison == 0);
+		usingEqualityOperator = OperatorImplementsEquality(opExpr->opno);
 
 		return usingEqualityOperator;
 	}
@@ -1043,4 +1054,25 @@ ColumnMatchExpressionAtTopLevelConjunction(Node *node, Var *column)
 	}
 
 	return false;
+}
+
+
+/*
+ * RouterSetRangeTablesInherited sets inh flag of all range table entries to true.
+ * We basically iterate over all range table entries and set their inh flag.
+ */
+static void
+SetRangeTablesInherited(Query *query)
+{
+	List *rangeTableList = query->rtable;
+	ListCell *rangeTableCell = NULL;
+
+	foreach(rangeTableCell, rangeTableList)
+	{
+		RangeTblEntry *rangeTableEntry = (RangeTblEntry *) lfirst(rangeTableCell);
+		if (rangeTableEntry->rtekind == RTE_RELATION)
+		{
+			rangeTableEntry->inh = true;
+		}
+	}
 }

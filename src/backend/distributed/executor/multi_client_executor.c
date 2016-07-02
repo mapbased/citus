@@ -19,7 +19,9 @@
 
 #include "commands/dbcommands.h"
 #include "distributed/metadata_cache.h"
+#include "distributed/connection_cache.h"
 #include "distributed/multi_client_executor.h"
+#include "distributed/multi_server_executor.h"
 
 #include <errno.h>
 #include <unistd.h>
@@ -49,9 +51,6 @@ static PostgresPollingStatusType ClientPollingStatusArray[MAX_CONNECTION_COUNT];
 static void ClearRemainingResults(PGconn *connection);
 static bool ClientConnectionReady(PGconn *connection,
 								  PostgresPollingStatusType pollingStatus);
-static void ReportRemoteError(PGconn *connection, PGresult *result);
-static void ReportConnectionError(PGconn *connection);
-static char * ConnectionGetOptionValue(PGconn *connection, char *optionKeyword);
 
 
 /* AllocateConnectionId returns a connection id from the connection pool. */
@@ -142,7 +141,7 @@ MultiClientConnect(const char *nodeName, uint32 nodePort, const char *nodeDataba
 	}
 	else
 	{
-		ReportConnectionError(connection);
+		WarnRemoteError(connection, NULL);
 
 		PQfinish(connection);
 		connectionId = INVALID_CONNECTION_ID;
@@ -195,7 +194,7 @@ MultiClientConnectStart(const char *nodeName, uint32 nodePort, const char *nodeD
 	}
 	else
 	{
-		ReportConnectionError(connection);
+		WarnRemoteError(connection, NULL);
 
 		PQfinish(connection);
 		connectionId = INVALID_CONNECTION_ID;
@@ -228,9 +227,12 @@ MultiClientConnectPoll(int32 connectionId)
 		if (readReady)
 		{
 			ClientPollingStatusArray[connectionId] = PQconnectPoll(connection);
+			connectStatus = CLIENT_CONNECTION_BUSY;
 		}
-
-		connectStatus = CLIENT_CONNECTION_BUSY;
+		else
+		{
+			connectStatus = CLIENT_CONNECTION_BUSY_READ;
+		}
 	}
 	else if (pollingStatus == PGRES_POLLING_WRITING)
 	{
@@ -238,13 +240,16 @@ MultiClientConnectPoll(int32 connectionId)
 		if (writeReady)
 		{
 			ClientPollingStatusArray[connectionId] = PQconnectPoll(connection);
+			connectStatus = CLIENT_CONNECTION_BUSY;
 		}
-
-		connectStatus = CLIENT_CONNECTION_BUSY;
+		else
+		{
+			connectStatus = CLIENT_CONNECTION_BUSY_WRITE;
+		}
 	}
 	else if (pollingStatus == PGRES_POLLING_FAILED)
 	{
-		ReportConnectionError(connection);
+		WarnRemoteError(connection, NULL);
 
 		connectStatus = CLIENT_CONNECTION_BAD;
 	}
@@ -428,7 +433,7 @@ MultiClientQueryResult(int32 connectionId, void **queryResult, int *rowCount,
 	}
 	else
 	{
-		ReportRemoteError(connection, result);
+		WarnRemoteError(connection, result);
 		PQclear(result);
 	}
 
@@ -495,7 +500,7 @@ MultiClientBatchResult(int32 connectionId, void **queryResult, int *rowCount,
 	}
 	else
 	{
-		ReportRemoteError(connection, result);
+		WarnRemoteError(connection, result);
 		PQclear(result);
 		queryStatus = CLIENT_BATCH_QUERY_FAILED;
 	}
@@ -580,7 +585,7 @@ MultiClientQueryStatus(int32 connectionId)
 			copyResults = true;
 		}
 
-		ReportRemoteError(connection, result);
+		WarnRemoteError(connection, result);
 	}
 
 	/* clear the result object */
@@ -670,7 +675,7 @@ MultiClientCopyData(int32 connectionId, int32 fileDescriptor)
 		{
 			copyStatus = CLIENT_COPY_FAILED;
 
-			ReportRemoteError(connection, result);
+			WarnRemoteError(connection, result);
 		}
 
 		PQclear(result);
@@ -680,7 +685,7 @@ MultiClientCopyData(int32 connectionId, int32 fileDescriptor)
 		/* received an error */
 		copyStatus = CLIENT_COPY_FAILED;
 
-		ReportConnectionError(connection);
+		WarnRemoteError(connection, NULL);
 	}
 
 	/* if copy out completed, make sure we drain all results from libpq */
@@ -690,6 +695,160 @@ MultiClientCopyData(int32 connectionId, int32 fileDescriptor)
 	}
 
 	return copyStatus;
+}
+
+
+/*
+ * MultiClientCreateWaitInfo creates a WaitInfo structure, capable of keeping
+ * track of what maxConnections connections are waiting for; to allow
+ * efficiently waiting for all of them at once.
+ *
+ * Connections can be added using MultiClientRegisterWait(). All added
+ * connections can then be waited upon together using MultiClientWait().
+ */
+WaitInfo *
+MultiClientCreateWaitInfo(int maxConnections)
+{
+	WaitInfo *waitInfo = palloc(sizeof(WaitInfo));
+
+	waitInfo->maxWaiters = maxConnections;
+	waitInfo->pollfds = palloc(maxConnections * sizeof(struct pollfd));
+
+	/* initialize remaining fields */
+	MultiClientResetWaitInfo(waitInfo);
+
+	return waitInfo;
+}
+
+
+/* MultiClientResetWaitInfo clears all pending waits from a WaitInfo. */
+void
+MultiClientResetWaitInfo(WaitInfo *waitInfo)
+{
+	waitInfo->registeredWaiters = 0;
+	waitInfo->haveReadyWaiter = false;
+	waitInfo->haveFailedWaiter = false;
+}
+
+
+/* MultiClientFreeWaitInfo frees a resources associated with a waitInfo struct. */
+void
+MultiClientFreeWaitInfo(WaitInfo *waitInfo)
+{
+	pfree(waitInfo->pollfds);
+	pfree(waitInfo);
+}
+
+
+/*
+ * MultiClientRegisterWait adds a connection to be waited upon, waiting for
+ * executionStatus.
+ */
+void
+MultiClientRegisterWait(WaitInfo *waitInfo, TaskExecutionStatus executionStatus,
+						int32 connectionId)
+{
+	PGconn *connection = NULL;
+	struct pollfd *pollfd = NULL;
+
+	Assert(waitInfo->registeredWaiters < waitInfo->maxWaiters);
+
+	if (executionStatus == TASK_STATUS_READY)
+	{
+		waitInfo->haveReadyWaiter = true;
+		return;
+	}
+	else if (executionStatus == TASK_STATUS_ERROR)
+	{
+		waitInfo->haveFailedWaiter = true;
+		return;
+	}
+
+	connection = ClientConnectionArray[connectionId];
+	pollfd = &waitInfo->pollfds[waitInfo->registeredWaiters];
+	pollfd->fd = PQsocket(connection);
+	if (executionStatus == TASK_STATUS_SOCKET_READ)
+	{
+		pollfd->events = POLLERR | POLLIN;
+	}
+	else if (executionStatus == TASK_STATUS_SOCKET_WRITE)
+	{
+		pollfd->events = POLLERR | POLLOUT;
+	}
+	waitInfo->registeredWaiters++;
+}
+
+
+/*
+ * MultiClientWait waits until at least one connection added with
+ * MultiClientRegisterWait is ready to be processed again.
+ */
+void
+MultiClientWait(WaitInfo *waitInfo)
+{
+	long sleepIntervalPerCycle = RemoteTaskCheckInterval * 1000L;
+
+	/*
+	 * If we had a failure, we always want to sleep for a bit, to prevent
+	 * flooding the other system, probably making the situation worse.
+	 */
+	if (waitInfo->haveFailedWaiter)
+	{
+		pg_usleep(sleepIntervalPerCycle);
+		return;
+	}
+
+	/* if there are tasks that already need attention again, don't wait */
+	if (waitInfo->haveReadyWaiter)
+	{
+		return;
+	}
+
+	while (true)
+	{
+		/*
+		 * Wait for activity on any of the sockets. Limit the maximum time
+		 * spent waiting in one wait cycle, as insurance against edge
+		 * cases. For efficiency we don't want wake up quite as often as
+		 * citus.remote_task_check_interval, so rather arbitrarily sleep ten
+		 * times as long.
+		 */
+		int rc = poll(waitInfo->pollfds, waitInfo->registeredWaiters,
+					  sleepIntervalPerCycle * 10);
+
+		if (rc < 0)
+		{
+			/*
+			 * Signals that arrive can interrupt our poll(). In that case just
+			 * check for interrupts, and try again. Every other error is
+			 * unexpected and treated as such.
+			 */
+			if (errno == EAGAIN || errno == EINTR)
+			{
+				CHECK_FOR_INTERRUPTS();
+
+				/* maximum wait starts at max again, but that's ok, it's just a stopgap */
+				continue;
+			}
+			else
+			{
+				ereport(ERROR, (errcode_for_file_access(),
+								errmsg("poll failed: %m")));
+			}
+		}
+		else if (rc == 0)
+		{
+			ereport(DEBUG2,
+					(errmsg("waiting for activity on tasks took longer than %ld ms",
+							(long) RemoteTaskCheckInterval * 10)));
+		}
+
+		/*
+		 * At least one fd changed received a readiness notification, time to
+		 * process tasks again.
+		 */
+		return;
+	}
 }
 
 
@@ -805,98 +964,4 @@ ClientConnectionReady(PGconn *connection, PostgresPollingStatusType pollingStatu
 	}
 
 	return clientConnectionReady;
-}
-
-
-/*
- * ReportRemoteError retrieves various error fields from the a remote result and
- * produces an error report at the WARNING level.
- */
-static void
-ReportRemoteError(PGconn *connection, PGresult *result)
-{
-	char *sqlStateString = PQresultErrorField(result, PG_DIAG_SQLSTATE);
-	char *remoteMessage = PQresultErrorField(result, PG_DIAG_MESSAGE_PRIMARY);
-	char *nodeName = ConnectionGetOptionValue(connection, "host");
-	char *nodePort = ConnectionGetOptionValue(connection, "port");
-	char *errorPrefix = "could not connect to node";
-	int sqlState = ERRCODE_CONNECTION_FAILURE;
-
-	if (sqlStateString != NULL)
-	{
-		sqlState = MAKE_SQLSTATE(sqlStateString[0], sqlStateString[1], sqlStateString[2],
-								 sqlStateString[3], sqlStateString[4]);
-
-		/* use more specific error prefix for result failures */
-		if (sqlState != ERRCODE_CONNECTION_FAILURE)
-		{
-			errorPrefix = "could not receive query results from";
-		}
-	}
-
-	/*
-	 * If the PGresult did not contain a message, the connection may provide a
-	 * suitable top level one. At worst, this is an empty string.
-	 */
-	if (remoteMessage == NULL)
-	{
-		char *lastNewlineIndex = NULL;
-
-		remoteMessage = PQerrorMessage(connection);
-		lastNewlineIndex = strrchr(remoteMessage, '\n');
-
-		/* trim trailing newline, if any */
-		if (lastNewlineIndex != NULL)
-		{
-			*lastNewlineIndex = '\0';
-		}
-	}
-
-	ereport(WARNING, (errcode(sqlState),
-					  errmsg("%s %s:%s", errorPrefix, nodeName, nodePort),
-					  errdetail("Client error: %s", remoteMessage)));
-}
-
-
-/*
- * ReportConnectionError raises a WARNING and reports that we could not
- * establish the given connection.
- */
-static void
-ReportConnectionError(PGconn *connection)
-{
-	char *nodeName = ConnectionGetOptionValue(connection, "host");
-	char *nodePort = ConnectionGetOptionValue(connection, "port");
-	char *errorMessage = PQerrorMessage(connection);
-
-	ereport(WARNING, (errcode(ERRCODE_CONNECTION_FAILURE),
-					  errmsg("could not connect to node %s:%s", nodeName, nodePort),
-					  errdetail("Client error: %s", errorMessage)));
-}
-
-
-/*
- * ConnectionGetOptionValue inspects the provided connection for an option with
- * a given keyword and returns a new palloc'd string with that options's value.
- * The function returns NULL if the connection has no setting for an option with
- * the provided keyword.
- */
-static char *
-ConnectionGetOptionValue(PGconn *connection, char *optionKeyword)
-{
-	char *optionValue = NULL;
-	PQconninfoOption *option = NULL;
-	PQconninfoOption *conninfoOptions = PQconninfo(connection);
-
-	for (option = conninfoOptions; option->keyword != NULL; option++)
-	{
-		if (strncmp(option->keyword, optionKeyword, NAMEDATALEN) == 0)
-		{
-			optionValue = pstrdup(option->val);
-		}
-	}
-
-	PQconninfoFree(conninfoOptions);
-
-	return optionValue;
 }

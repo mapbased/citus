@@ -1,8 +1,12 @@
 --
 -- MULTI_SINGLE_RELATION_SUBQUERY
 --
-
 -- This test checks that we are able to run selected set of distributed SQL subqueries.
+
+
+ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 860000;
+ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 860000;
+
 
 SET citus.task_executor_type TO 'task-tracker';
 
@@ -125,10 +129,10 @@ from
     group by
         l_tax) as distributed_table;
 
--- Check that we don't support subqueries with count(distinct).
+-- Check that we support subqueries with count(distinct).
 
 select
-    different_shipment_days
+    avg(different_shipment_days)
 from
     (select
         count(distinct l_shipdate) as different_shipment_days
@@ -148,7 +152,7 @@ SELECT max(l_suppkey) FROM
                 l_suppkey,
                 count(*)
             FROM
-                lineitem_subquery
+                lineitem
             WHERE
                 l_orderkey < 20000
             GROUP BY

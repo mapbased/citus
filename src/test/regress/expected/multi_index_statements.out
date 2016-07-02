@@ -3,6 +3,8 @@
 --
 -- Check that we can run CREATE INDEX and DROP INDEX statements on distributed
 -- tables.
+ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 640000;
+ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 640000;
 --
 -- CREATE TEST TABLES
 --
@@ -137,12 +139,13 @@ ERROR:  creating unique indexes on append-partitioned tables is currently unsupp
 CREATE INDEX lineitem_orderkey_index ON lineitem (l_orderkey);
 ERROR:  relation "lineitem_orderkey_index" already exists
 CREATE INDEX try_index ON lineitem USING gist (l_orderkey);
-WARNING:  could not receive query results from localhost:57637
-DETAIL:  Client error: data type bigint has no default operator class for access method "gist"
+WARNING:  data type bigint has no default operator class for access method "gist"
+HINT:  You must specify an operator class for the index or define a default operator class for the data type.
+CONTEXT:  while executing command on localhost:57638
 ERROR:  could not execute DDL command on worker node shards
 CREATE INDEX try_index ON lineitem (non_existent_column);
-WARNING:  could not receive query results from localhost:57637
-DETAIL:  Client error: column "non_existent_column" does not exist
+WARNING:  column "non_existent_column" does not exist
+CONTEXT:  while executing command on localhost:57638
 ERROR:  could not execute DDL command on worker node shards
 CREATE INDEX ON lineitem (l_orderkey);
 ERROR:  creating index without a name on a distributed table is currently unsupported

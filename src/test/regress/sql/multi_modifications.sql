@@ -1,3 +1,8 @@
+
+ALTER SEQUENCE pg_catalog.pg_dist_shardid_seq RESTART 750000;
+ALTER SEQUENCE pg_catalog.pg_dist_jobid_seq RESTART 750000;
+
+
 -- ===================================================================
 -- test end-to-end modification functionality
 -- ===================================================================
@@ -13,16 +18,24 @@ CREATE TABLE limit_orders (
 	limit_price decimal NOT NULL DEFAULT 0.00 CHECK (limit_price >= 0.00)
 );
 
+
+CREATE TABLE multiple_hash (
+	category text NOT NULL,
+	data text NOT NULL
+);
+
 CREATE TABLE insufficient_shards ( LIKE limit_orders );
 CREATE TABLE range_partitioned ( LIKE limit_orders );
 CREATE TABLE append_partitioned ( LIKE limit_orders );
 
 SELECT master_create_distributed_table('limit_orders', 'id', 'hash');
+SELECT master_create_distributed_table('multiple_hash', 'category', 'hash');
 SELECT master_create_distributed_table('insufficient_shards', 'id', 'hash');
 SELECT master_create_distributed_table('range_partitioned', 'id', 'range');
 SELECT master_create_distributed_table('append_partitioned', 'id', 'append');
 
 SELECT master_create_worker_shards('limit_orders', 2, 2);
+SELECT master_create_worker_shards('multiple_hash', 2, 2);
 
 -- make a single shard that covers no partition values
 SELECT master_create_worker_shards('insufficient_shards', 1, 1);
@@ -55,6 +68,9 @@ WHERE shardid = :new_shard_id;
 INSERT INTO limit_orders VALUES (32743, 'AAPL', 9580, '2004-10-19 10:23:54', 'buy',
 								 20.69);
 SELECT COUNT(*) FROM limit_orders WHERE id = 32743;
+
+-- basic single-row INSERT with RETURNING
+INSERT INTO limit_orders VALUES (32744, 'AAPL', 9580, '2004-10-19 10:23:54', 'buy', 20.69) RETURNING *;
 
 -- try a single-row INSERT with no shard to receive it
 INSERT INTO insufficient_shards VALUES (32743, 'AAPL', 9580, '2004-10-19 10:23:54', 'buy',
@@ -105,9 +121,15 @@ INSERT INTO limit_orders VALUES (NULL, 'T', 975234, DEFAULT);
 -- INSERT violating column constraint
 INSERT INTO limit_orders VALUES (18811, 'BUD', 14962, '2014-04-05 08:32:16', 'sell',
 								 -5.00);
-
 -- INSERT violating primary key constraint
 INSERT INTO limit_orders VALUES (32743, 'LUV', 5994, '2001-04-16 03:37:28', 'buy', 0.58);
+
+-- INSERT violating primary key constraint, with RETURNING specified.
+INSERT INTO limit_orders VALUES (32743, 'LUV', 5994, '2001-04-16 03:37:28', 'buy', 0.58) RETURNING *;
+
+-- INSERT, with RETURNING specified, failing with a non-constraint error
+INSERT INTO limit_orders VALUES (34153, 'LEE', 5994, '2001-04-16 03:37:28', 'buy', 0.58) RETURNING id / 0;
+
 
 SET client_min_messages TO DEFAULT;
 
@@ -130,10 +152,6 @@ INSERT INTO limit_orders VALUES (DEFAULT), (DEFAULT);
 -- INSERT ... SELECT ... FROM commands are unsupported
 INSERT INTO limit_orders SELECT * FROM limit_orders;
 
--- commands with a RETURNING clause are unsupported
-INSERT INTO limit_orders VALUES (7285, 'AMZN', 3278, '2016-01-05 02:07:36', 'sell', 0.00)
-						 RETURNING *;
-
 -- commands containing a CTE are unsupported
 WITH deleted_orders AS (DELETE FROM limit_orders RETURNING *)
 INSERT INTO limit_orders DEFAULT VALUES;
@@ -144,6 +162,10 @@ SELECT COUNT(*) FROM limit_orders WHERE id = 246;
 
 DELETE FROM limit_orders WHERE id = 246;
 SELECT COUNT(*) FROM limit_orders WHERE id = 246;
+
+-- test simple DELETE with RETURNING
+DELETE FROM limit_orders WHERE id = 430 RETURNING *;
+SELECT COUNT(*) FROM limit_orders WHERE id = 430;
 
 -- DELETE with expression in WHERE clause
 INSERT INTO limit_orders VALUES (246, 'TSLA', 162, '2007-07-02 16:32:15', 'sell', 20.69);
@@ -161,9 +183,6 @@ DELETE FROM limit_orders USING bidders WHERE limit_orders.id = 246 AND
 											 limit_orders.bidder_id = bidders.id AND
 											 bidders.name = 'Bernie Madoff';
 
--- commands with a RETURNING clause are unsupported
-DELETE FROM limit_orders WHERE id = 246 RETURNING *;
-
 -- commands containing a CTE are unsupported
 WITH deleted_orders AS (INSERT INTO limit_orders DEFAULT VALUES RETURNING *)
 DELETE FROM limit_orders;
@@ -177,36 +196,44 @@ INSERT INTO limit_orders VALUES (246, 'TSLA', 162, '2007-07-02 16:32:15', 'sell'
 UPDATE limit_orders SET symbol = 'GM' WHERE id = 246;
 SELECT symbol FROM limit_orders WHERE id = 246;
 
+-- simple UPDATE with RETURNING
+UPDATE limit_orders SET symbol = 'GM' WHERE id = 246 RETURNING *;
+
 -- expression UPDATE
 UPDATE limit_orders SET bidder_id = 6 * 3 WHERE id = 246;
 SELECT bidder_id FROM limit_orders WHERE id = 246;
+
+-- expression UPDATE with RETURNING
+UPDATE limit_orders SET bidder_id = 6 * 5 WHERE id = 246 RETURNING *;
 
 -- multi-column UPDATE
 UPDATE limit_orders SET (kind, limit_price) = ('buy', DEFAULT) WHERE id = 246;
 SELECT kind, limit_price FROM limit_orders WHERE id = 246;
 
+-- multi-column UPDATE with RETURNING
+UPDATE limit_orders SET (kind, limit_price) = ('buy', 999) WHERE id = 246 RETURNING *;
+
+-- Test that on unique contraint violations, we fail fast
+INSERT INTO limit_orders VALUES (275, 'ADR', 140, '2007-07-02 16:32:15', 'sell', 43.67);
+INSERT INTO limit_orders VALUES (275, 'ADR', 140, '2007-07-02 16:32:15', 'sell', 43.67);
+
 -- Test that shards which miss a modification are marked unhealthy
 
--- First: Mark all placements for a node as inactive
-UPDATE pg_dist_shard_placement
-SET    shardstate = 3
-WHERE  nodename = 'localhost' AND
-	   nodeport = :worker_1_port;
+-- First: Connect to the second worker node
+\c - - - :worker_2_port
 
--- Second: Perform an INSERT to the remaining node
-INSERT INTO limit_orders VALUES (275, 'ADR', 140, '2007-07-02 16:32:15', 'sell', 43.67);
+-- Second: Move aside limit_orders shard on the second worker node
+ALTER TABLE limit_orders_750000 RENAME TO renamed_orders;
 
--- Third: Mark the original placements as healthy again
-UPDATE pg_dist_shard_placement
-SET    shardstate = 1
-WHERE  nodename = 'localhost' AND
-	   nodeport = :worker_1_port;
+-- Third: Connect back to master node
+\c - - - :master_port
 
--- Fourth: Perform the same INSERT (primary key violation)
-INSERT INTO limit_orders VALUES (275, 'ADR', 140, '2007-07-02 16:32:15', 'sell', 43.67);
+-- Fourth: Perform an INSERT on the remaining node
+INSERT INTO limit_orders VALUES (276, 'ADR', 140, '2007-07-02 16:32:15', 'sell', 43.67);
 
--- Last: Verify the insert worked but the placement with the PK violation is now unhealthy
-SELECT count(*) FROM limit_orders WHERE id = 275;
+-- Last: Verify the insert worked but the deleted placement is now unhealthy
+SELECT count(*) FROM limit_orders WHERE id = 276;
+
 SELECT count(*)
 FROM   pg_dist_shard_placement AS sp,
 	   pg_dist_shard           AS s
@@ -215,6 +242,41 @@ AND    sp.nodename = 'localhost'
 AND    sp.nodeport = :worker_2_port
 AND    sp.shardstate = 3
 AND    s.logicalrelid = 'limit_orders'::regclass;
+
+-- Test that if all shards miss a modification, no state change occurs
+
+-- First: Connect to the first worker node
+\c - - - :worker_1_port
+
+-- Second: Move aside limit_orders shard on the second worker node
+ALTER TABLE limit_orders_750000 RENAME TO renamed_orders;
+
+-- Third: Connect back to master node
+\c - - - :master_port
+
+-- Fourth: Perform an INSERT on the remaining node
+INSERT INTO limit_orders VALUES (276, 'ADR', 140, '2007-07-02 16:32:15', 'sell', 43.67);
+
+-- Last: Verify worker is still healthy
+SELECT count(*)
+FROM   pg_dist_shard_placement AS sp,
+	   pg_dist_shard           AS s
+WHERE  sp.shardid = s.shardid
+AND    sp.nodename = 'localhost'
+AND    sp.nodeport = :worker_1_port
+AND    sp.shardstate = 1
+AND    s.logicalrelid = 'limit_orders'::regclass;
+
+-- Undo our change...
+
+-- First: Connect to the first worker node
+\c - - - :worker_1_port
+
+-- Second: Move aside limit_orders shard on the second worker node
+ALTER TABLE renamed_orders RENAME TO limit_orders_750000;
+
+-- Third: Connect back to master node
+\c - - - :master_port
 
 -- commands with no constraints on the partition key are not supported
 UPDATE limit_orders SET limit_price = 0.00;
@@ -227,9 +289,6 @@ UPDATE limit_orders SET limit_price = 0.00 FROM bidders
 					WHERE limit_orders.id = 246 AND
 						  limit_orders.bidder_id = bidders.id AND
 						  bidders.name = 'Bernie Madoff';
-
--- commands with a RETURNING clause are unsupported
-UPDATE limit_orders SET symbol = 'GM' WHERE id = 246 RETURNING *;
 
 -- commands containing a CTE are unsupported
 WITH deleted_orders AS (INSERT INTO limit_orders DEFAULT VALUES RETURNING *)
@@ -248,8 +307,56 @@ UPDATE limit_orders SET symbol = LOWER(symbol) WHERE id = 246;
 
 SELECT symbol, bidder_id FROM limit_orders WHERE id = 246;
 
+-- IMMUTABLE functions are allowed -- even in returning
+UPDATE limit_orders SET symbol = UPPER(symbol) WHERE id = 246 RETURNING id, LOWER(symbol), symbol;
+
 -- updates referencing non-IMMUTABLE functions are unsupported
 UPDATE limit_orders SET placed_at = now() WHERE id = 246;
 
+-- even in RETURNING
+UPDATE limit_orders SET placed_at = placed_at WHERE id = 246 RETURNING NOW();
+
 -- cursors are not supported
 UPDATE limit_orders SET symbol = 'GM' WHERE CURRENT OF cursor_name;
+
+-- check that multi-row UPDATE/DELETEs with RETURNING work
+INSERT INTO multiple_hash VALUES ('0', '1');
+INSERT INTO multiple_hash VALUES ('0', '2');
+INSERT INTO multiple_hash VALUES ('0', '3');
+INSERT INTO multiple_hash VALUES ('0', '4');
+INSERT INTO multiple_hash VALUES ('0', '5');
+INSERT INTO multiple_hash VALUES ('0', '6');
+
+UPDATE multiple_hash SET data = data ||'-1' WHERE category = '0' RETURNING *;
+DELETE FROM multiple_hash WHERE category = '0' RETURNING *;
+
+-- ensure returned row counters are correct
+\set QUIET off
+INSERT INTO multiple_hash VALUES ('1', '1');
+INSERT INTO multiple_hash VALUES ('1', '2');
+INSERT INTO multiple_hash VALUES ('1', '3');
+INSERT INTO multiple_hash VALUES ('2', '1');
+INSERT INTO multiple_hash VALUES ('2', '2');
+INSERT INTO multiple_hash VALUES ('2', '3');
+INSERT INTO multiple_hash VALUES ('2', '3') RETURNING *;
+
+-- check that update return the right number of rows
+-- one row
+UPDATE multiple_hash SET data = data ||'-1' WHERE category = '1' AND data = '1';
+-- three rows
+UPDATE multiple_hash SET data = data ||'-2' WHERE category = '1';
+-- three rows, with RETURNING
+UPDATE multiple_hash SET data = data ||'-2' WHERE category = '1' RETURNING category;
+-- check
+SELECT * FROM multiple_hash WHERE category = '1' ORDER BY category, data;
+
+-- check that deletes return the right number of rows
+-- one row
+DELETE FROM multiple_hash WHERE category = '2' AND data = '1';
+-- two rows
+DELETE FROM multiple_hash WHERE category = '2';
+-- three rows, with RETURNING
+DELETE FROM multiple_hash WHERE category = '1' RETURNING category;
+-- check
+SELECT * FROM multiple_hash WHERE category = '1' ORDER BY category, data;
+SELECT * FROM multiple_hash WHERE category = '2' ORDER BY category, data;

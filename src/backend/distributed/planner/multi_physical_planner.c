@@ -2008,7 +2008,7 @@ SubquerySqlTaskList(Job *job)
 			ShardInterval *shardInterval = (ShardInterval *) lfirst(shardIntervalCell);
 
 			RangeTableFragment *shardFragment = palloc0(fragmentSize);
-			shardFragment->fragmentReference = &(shardInterval->shardId);
+			shardFragment->fragmentReference = shardInterval;
 			shardFragment->fragmentType = CITUS_RTE_RELATION;
 			shardFragment->rangeTableId = tableId;
 
@@ -2449,7 +2449,7 @@ RangeTableFragmentsList(List *rangeTableList, List *whereClauseList,
 					(ShardInterval *) lfirst(shardIntervalCell);
 
 				RangeTableFragment *shardFragment = palloc0(fragmentSize);
-				shardFragment->fragmentReference = &shardInterval->shardId;
+				shardFragment->fragmentReference = shardInterval;
 				shardFragment->fragmentType = CITUS_RTE_RELATION;
 				shardFragment->rangeTableId = tableId;
 
@@ -2861,9 +2861,8 @@ HashableClauseMutator(Node *originalNode, Var *partitionColumn)
 		ScalarArrayOpExpr *arrayOperatorExpression = (ScalarArrayOpExpr *) originalNode;
 		Node *leftOpExpression = linitial(arrayOperatorExpression->args);
 		Node *strippedLeftOpExpression = strip_implicit_coercions(leftOpExpression);
-		char *operatorName = get_opname(arrayOperatorExpression->opno);
-		int equalsCompare = strncmp(operatorName, EQUAL_OPERATOR_STRING, NAMEDATALEN);
-		bool usingEqualityOperator = (equalsCompare == 0);
+		bool usingEqualityOperator = OperatorImplementsEquality(
+			arrayOperatorExpression->opno);
 
 		/*
 		 * Citus cannot prune hash-distributed shards with ANY/ALL. We show a NOTICE
@@ -3287,12 +3286,22 @@ JoinSequenceArray(List *rangeTableFragmentsList, Query *jobQuery, List *depended
 		foreach(nextJoinClauseCell, nextJoinClauseList)
 		{
 			OpExpr *nextJoinClause = (OpExpr *) lfirst(nextJoinClauseCell);
-			Var *leftColumn = LeftColumn(nextJoinClause);
-			Var *rightColumn = RightColumn(nextJoinClause);
-			Index leftRangeTableId = leftColumn->varno;
-			Index rightRangeTableId = rightColumn->varno;
+			Var *leftColumn = NULL;
+			Var *rightColumn = NULL;
+			Index leftRangeTableId = 0;
+			Index rightRangeTableId = 0;
 			bool leftPartitioned = false;
 			bool rightPartitioned = false;
+
+			if (!IsJoinClause((Node *) nextJoinClause))
+			{
+				continue;
+			}
+
+			leftColumn = LeftColumn(nextJoinClause);
+			rightColumn = RightColumn(nextJoinClause);
+			leftRangeTableId = leftColumn->varno;
+			rightRangeTableId = rightColumn->varno;
 
 			/*
 			 * We have a table from the existing join list joining with the next
@@ -3573,14 +3582,16 @@ FragmentInterval(RangeTableFragment *fragment)
 	ShardInterval *fragmentInterval = NULL;
 	if (fragment->fragmentType == CITUS_RTE_RELATION)
 	{
-		uint64 *shardId = (uint64 *) fragment->fragmentReference;
-
-		fragmentInterval = LoadShardInterval(*shardId);
+		Assert(CitusIsA(fragment->fragmentReference, ShardInterval));
+		fragmentInterval = (ShardInterval *) fragment->fragmentReference;
 	}
 	else if (fragment->fragmentType == CITUS_RTE_REMOTE_QUERY)
 	{
-		Task *mergeTask = (Task *) fragment->fragmentReference;
+		Task *mergeTask = NULL;
 
+		Assert(CitusIsA(fragment->fragmentReference, Task));
+
+		mergeTask = (Task *) fragment->fragmentReference;
 		fragmentInterval = mergeTask->shardInterval;
 	}
 
@@ -3592,17 +3603,16 @@ FragmentInterval(RangeTableFragment *fragment)
 bool
 ShardIntervalsOverlap(ShardInterval *firstInterval, ShardInterval *secondInterval)
 {
-	Oid typeId = InvalidOid;
-	FmgrInfo *comparisonFunction = NULL;
 	bool nonOverlap = false;
+	DistTableCacheEntry *intervalRelation =
+		DistributedTableCacheEntry(firstInterval->relationId);
+	FmgrInfo *comparisonFunction = intervalRelation->shardIntervalCompareFunction;
 
 	Datum firstMin = 0;
 	Datum firstMax = 0;
 	Datum secondMin = 0;
 	Datum secondMax = 0;
 
-	typeId = firstInterval->valueTypeId;
-	comparisonFunction = GetFunctionInfo(typeId, BTREE_AM_OID, BTORDER_PROC);
 
 	firstMin = firstInterval->minValue;
 	firstMax = firstInterval->maxValue;
@@ -3679,22 +3689,24 @@ UniqueFragmentList(List *fragmentList)
 
 	foreach(fragmentCell, fragmentList)
 	{
-		uint64 *shardId = NULL;
+		ShardInterval *shardInterval = NULL;
 		bool shardIdAlreadyAdded = false;
 		ListCell *uniqueFragmentCell = NULL;
 
 		RangeTableFragment *fragment = (RangeTableFragment *) lfirst(fragmentCell);
 		Assert(fragment->fragmentType == CITUS_RTE_RELATION);
 
-		shardId = fragment->fragmentReference;
+		Assert(CitusIsA(fragment->fragmentReference, ShardInterval));
+		shardInterval = (ShardInterval *) fragment->fragmentReference;
 
 		foreach(uniqueFragmentCell, uniqueFragmentList)
 		{
 			RangeTableFragment *uniqueFragment =
 				(RangeTableFragment *) lfirst(uniqueFragmentCell);
-			uint64 *uniqueShardId = uniqueFragment->fragmentReference;
+			ShardInterval *uniqueShardInterval =
+				(ShardInterval *) uniqueFragment->fragmentReference;
 
-			if (*shardId == *uniqueShardId)
+			if (shardInterval->shardId == uniqueShardInterval->shardId)
 			{
 				shardIdAlreadyAdded = true;
 				break;
@@ -3726,12 +3738,13 @@ DataFetchTaskList(uint64 jobId, uint32 taskIdIndex, List *fragmentList)
 		RangeTableFragment *fragment = (RangeTableFragment *) lfirst(fragmentCell);
 		if (fragment->fragmentType == CITUS_RTE_RELATION)
 		{
-			uint64 *shardId = fragment->fragmentReference;
-			StringInfo shardFetchQueryString = ShardFetchQueryString(*shardId);
+			ShardInterval *shardInterval = fragment->fragmentReference;
+			uint64 shardId = shardInterval->shardId;
+			StringInfo shardFetchQueryString = ShardFetchQueryString(shardId);
 
 			Task *shardFetchTask = CreateBasicTask(jobId, taskIdIndex, SHARD_FETCH_TASK,
 												   shardFetchQueryString->data);
-			shardFetchTask->shardId = (*shardId);
+			shardFetchTask->shardId = shardId;
 
 			dataFetchTaskList = lappend(dataFetchTaskList, shardFetchTask);
 			taskIdIndex++;
@@ -3961,7 +3974,8 @@ FragmentAlias(RangeTblEntry *rangeTableEntry, RangeTableFragment *fragment)
 	if (fragmentType == CITUS_RTE_RELATION)
 	{
 		char *shardAliasName = NULL;
-		uint64 *shardId = fragment->fragmentReference;
+		ShardInterval *shardInterval = (ShardInterval *) fragment->fragmentReference;
+		uint64 shardId = shardInterval->shardId;
 
 		Oid relationId = rangeTableEntry->relid;
 		char *relationName = get_rel_name(relationId);
@@ -3983,7 +3997,7 @@ FragmentAlias(RangeTblEntry *rangeTableEntry, RangeTableFragment *fragment)
 		 * If user specified a shard name in pg_dist_shard, use that name in alias.
 		 * Otherwise, set shard name in alias to <relation_name>_<shard_id>.
 		 */
-		shardAliasName = LoadShardAlias(relationId, *shardId);
+		shardAliasName = LoadShardAlias(relationId, shardId);
 		if (shardAliasName != NULL)
 		{
 			fragmentName = shardAliasName;
@@ -3991,7 +4005,7 @@ FragmentAlias(RangeTblEntry *rangeTableEntry, RangeTableFragment *fragment)
 		else
 		{
 			char *shardName = pstrdup(relationName);
-			AppendShardIdToName(&shardName, *shardId);
+			AppendShardIdToName(&shardName, shardId);
 
 			fragmentName = shardName;
 		}
@@ -4049,11 +4063,13 @@ AnchorShardId(List *fragmentList, uint32 anchorRangeTableId)
 		RangeTableFragment *fragment = (RangeTableFragment *) lfirst(fragmentCell);
 		if (fragment->rangeTableId == anchorRangeTableId)
 		{
-			uint64 *shardIdPointer = NULL;
-			Assert(fragment->fragmentType == CITUS_RTE_RELATION);
+			ShardInterval *shardInterval = NULL;
 
-			shardIdPointer = (uint64 *) fragment->fragmentReference;
-			anchorShardId = (*shardIdPointer);
+			Assert(fragment->fragmentType == CITUS_RTE_RELATION);
+			Assert(CitusIsA(fragment->fragmentReference, ShardInterval));
+
+			shardInterval = (ShardInterval *) fragment->fragmentReference;
+			anchorShardId = shardInterval->shardId;
 			break;
 		}
 	}
@@ -4343,13 +4359,16 @@ MergeTaskList(MapMergeJob *mapMergeJob, List *mapTaskList, uint32 taskIdIndex)
 		{
 			StringInfo mergeTableQueryString =
 				MergeTableQueryString(taskIdIndex, targetEntryList);
+			char *escapedMergeTableQueryString =
+				quote_literal_cstr(mergeTableQueryString->data);
 			StringInfo intermediateTableQueryString =
 				IntermediateTableQueryString(jobId, taskIdIndex, reduceQuery);
-
+			char *escapedIntermediateTableQueryString =
+				quote_literal_cstr(intermediateTableQueryString->data);
 			StringInfo mergeAndRunQueryString = makeStringInfo();
 			appendStringInfo(mergeAndRunQueryString, MERGE_FILES_AND_RUN_QUERY_COMMAND,
-							 jobId, taskIdIndex, mergeTableQueryString->data,
-							 intermediateTableQueryString->data);
+							 jobId, taskIdIndex, escapedMergeTableQueryString,
+							 escapedIntermediateTableQueryString);
 
 			mergeTask = CreateBasicTask(jobId, mergeTaskId, MERGE_TASK,
 										mergeAndRunQueryString->data);
